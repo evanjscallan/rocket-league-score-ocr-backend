@@ -54,6 +54,15 @@ app.add_middleware(
 )
 
 
+@app.middleware("http")
+async def normalize_slashes_middleware(request: Request, call_next):
+    path = request.scope.get("path", "")
+    if "//" in path:
+        import re
+        request.scope["path"] = re.sub(r"/+", "/", path)
+    return await call_next(request)
+
+
 @app.post("/refresh-game-state")
 def refresh_game_state() -> GameState:
     """Request and return one immediate OCR state sample from the active job."""
