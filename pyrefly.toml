@@ -1,0 +1,2 @@
+preset = "default"
+replace-imports-with-any = ["pytesseract"]
