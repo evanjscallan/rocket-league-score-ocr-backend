@@ -1,6 +1,8 @@
 import asyncio
 import hmac
+import os
 from queue import Empty, Queue
+import threading
 import time
 import traceback
 from typing import Literal, cast
@@ -323,27 +325,99 @@ def run_process_single_image(path_to_image: str, _: None = Depends(require_admin
             time_left=time_left_result,
         )
     return None
+class LiveStreamCapture:
+    """Demux frames in a background thread with zero buffer lag, decoding on demand."""
+
+    def __init__(self, source: str | int) -> None:
+        self.cap = cv2.VideoCapture(source)
+        self.is_file: bool = isinstance(source, str) and os.path.isfile(source)
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        self.frame_delay: float = 1.0 / fps if (self.is_file and fps and fps > 0) else 0.0
+        self.running: bool = True
+        self.stopped: bool = False
+        self.lock = threading.Lock()
+        self.new_frame_event = threading.Event()
+        self._decode_requested = threading.Event()
+        self._decode_completed = threading.Event()
+        self._retrieved_frame: np.ndarray | None = None
+        self._retrieve_success: bool = False
+        self.thread = threading.Thread(target=self._reader, daemon=True)
+        if self.cap.isOpened():
+            self.thread.start()
+
+    def isOpened(self) -> bool:
+        return self.cap.isOpened() and not self.stopped
+
+    def get(self, prop: int) -> float:
+        return self.cap.get(prop)
+
+    def _reader(self) -> None:
+        while self.running and self.cap.isOpened():
+            grabbed = self.cap.grab()
+            if not grabbed:
+                time.sleep(0.01)
+                continue
+            self.new_frame_event.set()
+            if self._decode_requested.is_set():
+                ret, frame = self.cap.retrieve()
+                with self.lock:
+                    self._retrieve_success = ret
+                    self._retrieved_frame = frame
+                self._decode_requested.clear()
+                self._decode_completed.set()
+            if self.frame_delay > 0:
+                time.sleep(self.frame_delay)
+        with self.lock:
+            self.stopped = True
+            self._decode_requested.clear()
+            self._decode_completed.set()
+
+    def read_latest(self, timeout: float = 2.0) -> tuple[bool, np.ndarray | None]:
+        """Request and retrieve the freshest frame on demand."""
+        if not self.isOpened():
+            return False, None
+        self._decode_completed.clear()
+        self._decode_requested.set()
+        if not self._decode_completed.wait(timeout=timeout):
+            self._decode_requested.clear()
+            return False, None
+        with self.lock:
+            if not self._retrieve_success or self._retrieved_frame is None:
+                return False, None
+            return True, self._retrieved_frame.copy()
+
+    def release(self) -> None:
+        self.running = False
+        self.stopped = True
+        self._decode_requested.clear()
+        self._decode_completed.set()
+        if self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+        self.cap.release()
+
+
 def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, realtime: bool = True) -> None:
     """Capture frames, service refresh requests, and publish stabilized OCR state."""
     print(f"\n--- Testing Video File: {path_to_video} ---")
-    cap: cv2.VideoCapture = cv2.VideoCapture(path_to_video if path_to_video else 0)
+    live_cap = LiveStreamCapture(path_to_video if path_to_video else 0)
 
-    if not cap.isOpened():
+    if not live_cap.isOpened():
         print("Could not open video.")
         return
 
-    fps: float = cap.get(cv2.CAP_PROP_FPS)
+    fps: float = live_cap.get(cv2.CAP_PROP_FPS)
     if not fps or fps <= 0:
         fps = 30.0
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     print(f"Capture opened at {fps:.2f} FPS; OCR runs every {seconds_interval:.1f} seconds.")
 
-    frame_count: int = 0
+    # Wait up to 5 seconds for the first frame to arrive
+    live_cap.new_frame_event.wait(timeout=5.0)
+
     sample_count: int = 0
     next_sample_at = time.monotonic()
     state_reducer = ocr.GameStateReducer()
 
-    while cap.isOpened():
+    while live_cap.isOpened():
         if constants.stop_requested.is_set():
             print("Stop requested; ending OCR job.")
             break
@@ -357,29 +431,18 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, re
         now = time.monotonic()
         needs_sample = refresh_was_requested or (now >= next_sample_at)
 
-        # CPU Optimization: When neither an OCR sample nor preview is needed,
-        # grab the frame packet to keep buffer fresh without decoding RGB pixels,
-        # and sleep briefly to prevent 100% CPU thread pinning.
         if not needs_sample and not preview_was_requested:
             if constants.stop_requested.is_set():
                 break
-            if not cap.grab():
-                time.sleep(0.05)
-            else:
-                time.sleep(0.033)
-            frame_count += 1
+            time.sleep(0.05)
             continue
 
-        read_started_at = time.monotonic()
-        ret, frame = cap.read()
-        read_elapsed = time.monotonic() - read_started_at
-        if not ret:
-            print(f"Capture returned no frame after {read_elapsed:.1f} seconds; ending OCR job.")
-            break
-
-        if constants.stop_requested.is_set():
-            print("Stop requested; ending OCR job.")
-            break
+        ret, frame = live_cap.read_latest()
+        if not ret or frame is None:
+            if constants.stop_requested.is_set():
+                break
+            time.sleep(0.05)
+            continue
 
         if preview_was_requested:
             ocr.cache_preview_frame(frame)
@@ -390,7 +453,7 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, re
             ocr.cache_preview_frame(frame)
             sample_count += 1
             t0 = time.monotonic()
-            print(f"Starting OCR sample {sample_count} after reading {frame_count + 1} frames.")
+            print(f"Starting OCR sample {sample_count} at {time.strftime('%H:%M:%S')}.")
             try:
                 blue_score_results, orange_score_results, detected_time = ocr.get_ocr_result(frame)
                 latest_result = state_reducer.update(
@@ -422,10 +485,8 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, re
                     constants.refresh_requested.clear()
                     constants.refresh_completed.set()
             next_sample_at = t0 + seconds_interval
-            frame_count += 1
-            continue
-        frame_count += 1
-    cap.release()
+
+    live_cap.release()
 
 def _run_local_video_job(path_to_video: str | None, seconds_interval: float, realtime: bool) -> None:
     """Manage OCR job lifecycle state around the capture processing loop."""

@@ -14,9 +14,11 @@ from auth import decode_base64, encode_base64
 from config import (
     ANOMALY_CONFIRMATIONS,
     BLUE_ROTATION,
+    DEBUG_IMAGE_WRITES,
     IMAGES_DIR,
     MAX_SCORE,
     ORANGE_ROTATION,
+    PREFERRED_QUALITIES,
     SAMPLE_CLOCK_TOLERANCE_SECONDS,
     TESSERACT_CONFIG,
     TIME_DIGITS_PATTERN,
@@ -120,9 +122,10 @@ def cache_preview_frame(frame: np.ndarray) -> None:
         )
         constants.next_preview_capture_id += 1
 
-    # Write latest normal vision and threshold vision frames to images directory
-    write_image(frame, "preview_normal")
-    write_image(threshold_preview_frame(frame, current_calibration()), "preview_threshold")
+    # Write latest normal vision and threshold vision frames to images directory if debug writes are enabled
+    if DEBUG_IMAGE_WRITES:
+        write_image(frame, "preview_normal")
+        write_image(threshold_preview_frame(frame, current_calibration()), "preview_threshold")
 
 
 def format_sse_event(event_json: str) -> str:
@@ -173,8 +176,8 @@ def preprocess_with_grayscale_kernel_thresh_and_padding(coordinates_img, zone_na
 
 
 def write_image(coordinates_img: np.ndarray | None, zone_name: str) -> None:
-    """Write an OCR debug/preview image to the backend/images directory."""
-    if coordinates_img is None:
+    """Write an OCR debug/preview image to the backend/images directory if enabled."""
+    if not DEBUG_IMAGE_WRITES or coordinates_img is None:
         return
     try:
         clean_name = zone_name.replace("-", "_")
@@ -616,7 +619,7 @@ def resolve_stream_url(stream_url: str) -> str:
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"Unable to resolve stream (channel may be offline or invalid): {exc}") from None
 
-    for quality in ("480p", "480p60", "720p", "720p60", "best"):
+    for quality in PREFERRED_QUALITIES:
         stream = streams.get(quality)
         if stream:
             return stream.to_url()
