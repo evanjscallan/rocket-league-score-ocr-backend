@@ -451,7 +451,7 @@ async def trigger_run_local_video(
         with constants.calibration_lock:
             constants.active_calibration = OCRCalibration(
                 blue_score=NormalizedRectangle(x=0.415, y=0.0, width=0.025, height=0.085),
-                time=NormalizedRectangle(x=0.460, y=0.0, width=0.080, height=0.030),
+                time=NormalizedRectangle(x=0.460, y=0.0, width=0.080, height=0.085),
                 orange_score=NormalizedRectangle(x=0.555, y=0.0, width=0.035, height=0.085),
             )
 

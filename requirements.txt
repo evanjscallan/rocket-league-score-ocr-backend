@@ -12,3 +12,4 @@ opencv-python==4.10.0.84
 pytesseract==0.3.13
 python-multipart
 streamlink>=8.5.0
+uvicorn>=0.30.0

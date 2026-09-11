@@ -44,3 +44,5 @@ Thumbs.db
 *.log
 test-assets/
 debug_output/
+images/*
+!images/.gitkeep

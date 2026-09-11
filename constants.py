@@ -30,7 +30,7 @@ next_event_id: int = 1
 
 active_calibration = OCRCalibration(
     blue_score=NormalizedRectangle(x=0.415, y=0.0, width=0.025, height=0.085),
-    time=NormalizedRectangle(x=0.460, y=0.0, width=0.080, height=0.030),
+    time=NormalizedRectangle(x=0.460, y=0.0, width=0.080, height=0.105),
     orange_score=NormalizedRectangle(x=0.555, y=0.0, width=0.035, height=0.085),
 )
 

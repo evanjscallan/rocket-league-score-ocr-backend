@@ -35,6 +35,8 @@ DEBUG_OCR: bool = os.getenv("DEBUG_OCR", "false").lower() == "true"
 # Asset Paths & OCR Config
 ASSET_DIRECTORY: Path = BASE_DIR.parent / "test-assets"
 ASSET_DIRECTORY.mkdir(parents=True, exist_ok=True)
+IMAGES_DIR: Path = BASE_DIR / "images"
+IMAGES_DIR.mkdir(parents=True, exist_ok=True)
 TESSDATA_DIR = BASE_DIR
 CUSTOM_DIGITS_PATH = TESSDATA_DIR / "custom_digits.traineddata"
 TESSERACT_CONFIG = f'--tessdata-dir "{TESSDATA_DIR}" -l custom_digits --psm 7 -c tessedit_char_whitelist=0123456789:+'

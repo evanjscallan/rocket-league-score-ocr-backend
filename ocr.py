@@ -13,10 +13,8 @@ import pytesseract
 from auth import decode_base64, encode_base64
 from config import (
     ANOMALY_CONFIRMATIONS,
-    ASSET_DIRECTORY,
     BLUE_ROTATION,
-    BOOTSTRAP_CONFIRMATIONS,
-    DEBUG_OCR,
+    IMAGES_DIR,
     MAX_SCORE,
     ORANGE_ROTATION,
     SAMPLE_CLOCK_TOLERANCE_SECONDS,
@@ -122,6 +120,10 @@ def cache_preview_frame(frame: np.ndarray) -> None:
         )
         constants.next_preview_capture_id += 1
 
+    # Write latest normal vision and threshold vision frames to images directory
+    write_image(frame, "preview_normal")
+    write_image(threshold_preview_frame(frame, current_calibration()), "preview_threshold")
+
 
 def format_sse_event(event_json: str) -> str:
     """Format serialized event data for a Server-Sent Events response."""
@@ -170,12 +172,16 @@ def preprocess_with_grayscale_kernel_thresh_and_padding(coordinates_img, zone_na
     return padded_thresh
 
 
-def write_image(coordinates_img, zone_name: str) -> None:
-    """Write a debug OCR image when debug output is enabled."""
-    if not DEBUG_OCR and os.getenv("DEBUG_OCR", "false").lower() != "true":
+def write_image(coordinates_img: np.ndarray | None, zone_name: str) -> None:
+    """Write an OCR debug/preview image to the backend/images directory."""
+    if coordinates_img is None:
         return
-    debug_output_path: str = str(ASSET_DIRECTORY / f"debug_{zone_name}.png")
-    cv2.imwrite(debug_output_path, coordinates_img)
+    try:
+        clean_name = zone_name.replace("-", "_")
+        output_path: str = str(IMAGES_DIR / f"{clean_name}.png")
+        cv2.imwrite(output_path, coordinates_img)
+    except Exception as exc:
+        print(f"Failed to write image {zone_name}: {exc}")
 
 def process_similar_numbers(detected_num: str | None, corrected_canvas: np.ndarray) -> str | Literal["N/A"]:
     """Apply shape heuristics to distinguish commonly confused OCR digits."""
@@ -242,7 +248,8 @@ def determine_number(coordinates_img: np.ndarray, zone_name: str) -> str | Liter
     else:
         corrected_canvas = padded_thresh
 
-    write_image(corrected_canvas, f"{zone_name}_thresh")
+    clean_zone = zone_name.replace("-", "_")
+    write_image(corrected_canvas, f"{clean_zone}_thresh")
     contours: Sequence[MatLike]
     contours, _ = cv2.findContours(corrected_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
@@ -274,8 +281,8 @@ def determine_number(coordinates_img: np.ndarray, zone_name: str) -> str | Liter
 def get_coordinates(original_img: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract calibrated blue-score, orange-score, and timer image regions."""
     calibration = current_calibration()
-    write_image(original_img, "preview_raw")
-    write_image(threshold_preview_frame(original_img, calibration), "preview_thresh")
+    write_image(original_img, "preview_normal")
+    write_image(threshold_preview_frame(original_img, calibration), "preview_threshold")
     blue_coordinates = normalized_crop(original_img, calibration.blue_score)
     orange_coordinates = normalized_crop(original_img, calibration.orange_score)
     time_coordinates = normalized_crop(original_img, calibration.time)
