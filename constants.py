@@ -11,7 +11,7 @@ from models import (
 
 # Locks and thread synchronization events
 video_state_lock = threading.Lock()
-event_lock = threading.Lock()
+event_lock = threading.RLock()
 refresh_request_lock = threading.Lock()
 refresh_requested = threading.Event()
 refresh_completed = threading.Event()

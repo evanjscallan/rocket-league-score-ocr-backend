@@ -179,7 +179,7 @@ def write_image(coordinates_img: np.ndarray | None, zone_name: str) -> None:
     try:
         clean_name = zone_name.replace("-", "_")
         output_path: str = str(IMAGES_DIR / f"{clean_name}.png")
-        cv2.imwrite(output_path, coordinates_img)
+        cv2.imwrite(output_path, coordinates_img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
     except Exception as exc:
         print(f"Failed to write image {zone_name}: {exc}")
 
@@ -250,15 +250,16 @@ def determine_number(coordinates_img: np.ndarray, zone_name: str) -> str | Liter
 
     clean_zone = zone_name.replace("-", "_")
     write_image(corrected_canvas, f"{clean_zone}_thresh")
-    contours: Sequence[MatLike]
-    contours, _ = cv2.findContours(corrected_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        largest_contour: np.ndarray = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(largest_contour) > 15:
-            _, _, w, h = cv2.boundingRect(largest_contour)
-            aspect_ratio: float = w / float(h)
-            if aspect_ratio < 0.38:
-                return "1"
+    if zone_name.endswith("score"):
+        contours: Sequence[MatLike]
+        contours, _ = cv2.findContours(corrected_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_contour: np.ndarray = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_contour) > 15:
+                _, _, w, h = cv2.boundingRect(largest_contour)
+                aspect_ratio: float = w / float(h)
+                if aspect_ratio < 0.38:
+                    return "1"
 
     detected_num: str = pytesseract.image_to_string(corrected_canvas, config=TESSERACT_CONFIG).strip()
     result: str = process_similar_numbers(detected_num, corrected_canvas)
@@ -375,6 +376,14 @@ class ClockTracker:
 
         elapsed_wall = max(0.0, now - self.last_update_monotonic)
 
+        # If the active clock is stale (>15s without a consistent reading), adopt immediately
+        if elapsed_wall > 15.0:
+            self.clock_seconds = detected_seconds
+            self.is_overtime = is_overtime
+            self.last_update_monotonic = now
+            self.pending_sample = None
+            return self.clock_seconds, self.is_overtime
+
         # 2. Check if reading is consistent with our active clock progression
         if self._is_consistent(self.clock_seconds, self.is_overtime, detected_seconds, is_overtime, elapsed_wall):
             self.clock_seconds = detected_seconds
@@ -387,8 +396,10 @@ class ClockTracker:
         if self.pending_sample is not None:
             pend_sec, pend_ot, pend_time = self.pending_sample
             pend_elapsed = max(0.0, now - pend_time)
+            if pend_elapsed > 10.0:
+                self.pending_sample = None
             # If confirmed by two consecutive samples, adopt the new clock baseline
-            if self._is_consistent(pend_sec, pend_ot, detected_seconds, is_overtime, pend_elapsed):
+            elif self._is_consistent(pend_sec, pend_ot, detected_seconds, is_overtime, pend_elapsed):
                 self.clock_seconds = detected_seconds
                 self.is_overtime = is_overtime
                 self.last_update_monotonic = now

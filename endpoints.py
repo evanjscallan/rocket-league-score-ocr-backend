@@ -1,9 +1,9 @@
-
+import asyncio
 import hmac
 from queue import Empty, Queue
 import time
 import traceback
-from typing import Literal
+from typing import Literal, cast
 import cv2
 from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, File, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,7 +13,6 @@ from numpy.typing import NDArray
 
 from auth import create_admin_session_token, is_valid_admin_credentials, require_admin_session
 from config import (
-    ADMIN_EDIT_PASSWORD,
     COOKIE_SAMESITE,
     COOKIE_SECURE,
     FRONTEND_ORIGINS,
@@ -23,10 +22,12 @@ from config import (
     publish_game_state_event,
 )
 import constants
+from datetime import datetime, timezone
 from models import (
     AdminPasswordRequest,
     AdminSessionState,
     GameState,
+    GameStateEvent,
     GameTimeState,
     NormalizedRectangle,
     OCRCalibration,
@@ -34,6 +35,7 @@ from models import (
     ScoreState,
     StreamStartRequest,
     StreamUrlRequest,
+    VideoJobStatus,
     VideoState,
 )
 import ocr
@@ -74,13 +76,19 @@ def refresh_game_state() -> GameState:
 
 @app.post("/stop-local-video")
 def stop_local_video() -> VideoState:
-    """Ask the active OCR capture loop to stop after its current read."""
+    """Ask the active OCR capture loop to stop and return the updated video state."""
     if constants.video_state.status not in {"queued", "running", "stopping"}:
         raise HTTPException(status_code=409, detail="No OCR video job is running")
     constants.stop_requested.set()
     constants.video_state.status = "stopping"
-    constants.video_state.message = "OCR video processing will stop after the current capture read"
+    constants.video_state.message = "OCR video processing stop requested"
     publish_game_state_event("stopping", "OCR video stop requested")
+
+    # Wait briefly for capture loop to exit and transition to idle
+    t_end = time.monotonic() + 3.0
+    while time.monotonic() < t_end and constants.video_state.status != "idle":
+        time.sleep(0.05)
+
     return constants.video_state
 
 
@@ -106,7 +114,7 @@ def update_ocr_calibration(calibration: OCRCalibration, _: None = Depends(requir
         if constants.video_state.status == "running":
             with constants.event_lock:
                 game_state = constants.latest_event.game_state if constants.latest_event else None
-                publish_game_state_event("running", "OCR calibration updated; state bootstrap restarted", game_state)
+            publish_game_state_event("running", "OCR calibration updated; state bootstrap restarted", game_state)
     return ocr.current_calibration()
 
 
@@ -180,25 +188,42 @@ def get_preview_frame(
     )
 
 @app.get("/game-state-events")
-def game_state_events() -> StreamingResponse:
+async def game_state_events(request: Request) -> StreamingResponse:
     """Stream the latest and future game-state events to public viewers."""
     subscriber: Queue[str] = Queue(maxsize=1)
 
     with constants.event_lock:
         constants.event_subscribers.add(subscriber)
-        initial_event = constants.latest_event.model_dump_json(exclude_none=True) if constants.latest_event else None
+        if constants.latest_event:
+            initial_event = constants.latest_event.model_dump_json(exclude_none=True)
+        else:
+            initial_event = GameStateEvent(
+                id=0,
+                timestamp=datetime.now(timezone.utc),
+                status=cast(VideoJobStatus, constants.video_state.status),
+                message=constants.video_state.message,
+                game_state=GameState(score_state=ScoreState(), time_left=GameTimeState()),
+            ).model_dump_json(exclude_none=True)
 
-    def event_stream():
+    async def event_stream():
         """Yield queued events and periodic SSE keepalive messages."""
+        last_ping = time.monotonic()
         try:
             if initial_event:
                 yield ocr.format_sse_event(initial_event)
 
             while True:
                 try:
-                    yield ocr.format_sse_event(subscriber.get(timeout=15))
+                    event_data = subscriber.get_nowait()
+                    yield ocr.format_sse_event(event_data)
+                    last_ping = time.monotonic()
                 except Empty:
-                    yield ": keepalive\n\n"
+                    if time.monotonic() - last_ping >= 15.0:
+                        yield ": keepalive\n\n"
+                        last_ping = time.monotonic()
+                    await asyncio.sleep(0.25)
+        except (asyncio.CancelledError, GeneratorExit):
+            pass
         finally:
             with constants.event_lock:
                 constants.event_subscribers.discard(subscriber)
@@ -206,7 +231,11 @@ def game_state_events() -> StreamingResponse:
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
     )
 
 @app.get("/game-state")
@@ -294,7 +323,7 @@ def run_process_single_image(path_to_image: str, _: None = Depends(require_admin
             time_left=time_left_result,
         )
     return None
-def run_local_video(path_to_video: str | None, seconds_interval: float = 2.0, realtime: bool = True) -> None:
+def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, realtime: bool = True) -> None:
     """Capture frames, service refresh requests, and publish stabilized OCR state."""
     print(f"\n--- Testing Video File: {path_to_video} ---")
     cap: cv2.VideoCapture = cv2.VideoCapture(path_to_video if path_to_video else 0)
@@ -319,8 +348,27 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 2.0, re
             print("Stop requested; ending OCR job.")
             break
 
-        if frame_count and frame_count % 60 == 0:
-            print(f"Read {frame_count} frames; waiting for the next OCR sample.")
+        if constants.reducer_reset_requested.is_set():
+            state_reducer = ocr.GameStateReducer()
+            constants.reducer_reset_requested.clear()
+
+        refresh_was_requested = constants.refresh_requested.is_set()
+        preview_was_requested = constants.preview_requested.is_set()
+        now = time.monotonic()
+        needs_sample = refresh_was_requested or (now >= next_sample_at)
+
+        # CPU Optimization: When neither an OCR sample nor preview is needed,
+        # grab the frame packet to keep buffer fresh without decoding RGB pixels,
+        # and sleep briefly to prevent 100% CPU thread pinning.
+        if not needs_sample and not preview_was_requested:
+            if constants.stop_requested.is_set():
+                break
+            if not cap.grab():
+                time.sleep(0.05)
+            else:
+                time.sleep(0.033)
+            frame_count += 1
+            continue
 
         read_started_at = time.monotonic()
         ret, frame = cap.read()
@@ -333,17 +381,12 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 2.0, re
             print("Stop requested; ending OCR job.")
             break
 
-        if constants.preview_requested.is_set():
+        if preview_was_requested:
             ocr.cache_preview_frame(frame)
             constants.preview_requested.clear()
             constants.preview_completed.set()
 
-        if constants.reducer_reset_requested.is_set():
-            state_reducer = ocr.GameStateReducer()
-            constants.reducer_reset_requested.clear()
-
-        refresh_was_requested = constants.refresh_requested.is_set()
-        if refresh_was_requested or time.monotonic() >= next_sample_at:
+        if needs_sample:
             ocr.cache_preview_frame(frame)
             sample_count += 1
             t0 = time.monotonic()

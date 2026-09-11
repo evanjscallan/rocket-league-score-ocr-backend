@@ -28,7 +28,7 @@ COOKIE_SAMESITE: Literal["lax", "strict", "none"] = cast(
 # Server & Stream Settings
 FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173").split(",")
 DEFAULT_STREAM_URL: str | None = os.getenv("STREAM_URL")
-SAMPLE_INTERVAL_SECONDS: float = 2.0
+SAMPLE_INTERVAL_SECONDS: float = 3.0
 PREFERRED_QUALITIES = ("720p", "720p60", "480p", "480p60", "best")
 DEBUG_OCR: bool = os.getenv("DEBUG_OCR", "false").lower() == "true"
 

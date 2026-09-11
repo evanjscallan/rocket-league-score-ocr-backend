@@ -4,13 +4,16 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
+VideoJobStatus = Literal["queued", "running", "completed", "failed", "idle", "stopping"]
+
+
 class VideoState(BaseModel):
     """Report the lifecycle and configuration of an OCR video job."""
 
-    status: str = "idle"
+    status: VideoJobStatus = "idle"
     message: str = "OCR video status is idle"
     path_to_video: str | None = None
-    seconds_interval: float | None = 2.0
+    seconds_interval: float | None = 3.0
     realtime: bool | None = True
     run_count: int = Field(default=0, exclude=True)
     last_error: str | None = Field(default=None, exclude=True)
@@ -35,7 +38,7 @@ class StreamStartRequest(BaseModel):
     """Validate stream input and sampling options for a new OCR job."""
 
     stream_url: str | None = Field(default=None, max_length=2048)
-    seconds_interval: float = Field(default=2.0, ge=0.25, le=60.0)
+    seconds_interval: float = Field(default=3.0, ge=0.25, le=60.0)
     realtime: bool = True
 
 
@@ -117,6 +120,6 @@ class GameStateEvent(BaseModel):
 
     id: int
     timestamp: datetime
-    status: Literal["queued", "running", "completed", "failed", "idle", "stopping"]
+    status: VideoJobStatus
     message: str
     game_state: GameState | None = None
