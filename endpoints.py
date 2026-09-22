@@ -183,8 +183,11 @@ async def start_local_video(
 
 
 @app.post("/refresh-preview-frame")
-def refresh_preview_frame(_: None = Depends(require_admin_session)) -> PreviewFrameMetadata:
-    """Request one current preview frame from the active capture loop."""
+def refresh_preview_frame(
+    mode: Literal["raw", "threshold"] = "raw",
+    _: None = Depends(require_admin_session),
+) -> Response:
+    """Request one current preview frame from the active capture loop and return the JPEG image."""
     if constants.video_state.status != "running":
         raise HTTPException(status_code=409, detail="No active OCR video job is available to refresh")
     if not constants.preview_request_lock.acquire(blocking=False):
@@ -198,10 +201,23 @@ def refresh_preview_frame(_: None = Depends(require_admin_session)) -> PreviewFr
         if constants.video_state.status != "running":
             raise HTTPException(status_code=409, detail="The OCR video job stopped before preview refresh completed")
         with constants.preview_lock:
+            preview_jpeg = constants.latest_preview_jpeg
+            preview_frame = constants.latest_preview_frame.copy() if constants.latest_preview_frame is not None else None
             metadata = constants.latest_preview_metadata
-        if metadata is None:
+        if preview_jpeg is None or preview_frame is None or metadata is None:
             raise HTTPException(status_code=503, detail="The preview refresh did not produce a frame")
-        return metadata
+        if mode == "threshold":
+            preview_jpeg = ocr.encode_preview_jpeg(ocr.threshold_preview_frame(preview_frame, ocr.current_calibration()))
+        return Response(
+            content=preview_jpeg,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-store",
+                "X-Capture-Id": str(metadata.capture_id),
+                "X-Frame-Width": str(metadata.frame_width),
+                "X-Frame-Height": str(metadata.frame_height),
+            },
+        )
     finally:
         constants.preview_request_lock.release()
 
