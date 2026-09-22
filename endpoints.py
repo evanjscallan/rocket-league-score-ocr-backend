@@ -97,9 +97,9 @@ def stop_local_video() -> VideoState:
     publish_game_state_event("stopping", "OCR video stop requested")
 
     # Wait briefly for capture loop to exit and transition to idle
-    t_end = time.monotonic() + 3.0
+    t_end = time.monotonic() + 1.5
     while time.monotonic() < t_end and constants.video_state.status != "idle":
-        time.sleep(0.05)
+        time.sleep(0.02)
 
     return constants.video_state
 
@@ -420,13 +420,13 @@ class LiveStreamCapture:
             self.thread.start()
 
     def isOpened(self) -> bool:
-        return self.cap.isOpened() and not self.stopped
+        return self.cap.isOpened() and not self.stopped and not constants.stop_requested.is_set()
 
     def get(self, prop: int) -> float:
         return self.cap.get(prop)
 
     def _reader(self) -> None:
-        while self.running and self.cap.isOpened():
+        while self.running and not self.stopped and not constants.stop_requested.is_set() and self.cap.isOpened():
             grabbed = self.cap.grab()
             if not grabbed:
                 time.sleep(0.01)
@@ -445,14 +445,22 @@ class LiveStreamCapture:
             self.stopped = True
             self._decode_requested.clear()
             self._decode_completed.set()
+            self.new_frame_event.set()
 
     def read_latest(self, timeout: float = 2.0) -> tuple[bool, np.ndarray | None]:
         """Request and retrieve the freshest frame on demand."""
-        if not self.isOpened():
+        if not self.isOpened() or constants.stop_requested.is_set():
             return False, None
         self._decode_completed.clear()
         self._decode_requested.set()
-        if not self._decode_completed.wait(timeout=timeout):
+        t_end = time.monotonic() + timeout
+        while time.monotonic() < t_end and not self._decode_completed.is_set():
+            if constants.stop_requested.is_set():
+                self._decode_requested.clear()
+                return False, None
+            self._decode_completed.wait(timeout=0.05)
+
+        if not self._decode_completed.is_set():
             self._decode_requested.clear()
             return False, None
         with self.lock:
@@ -465,9 +473,13 @@ class LiveStreamCapture:
         self.stopped = True
         self._decode_requested.clear()
         self._decode_completed.set()
+        self.new_frame_event.set()
+        try:
+            self.cap.release()
+        except Exception:
+            pass
         if self.thread.is_alive():
-            self.thread.join(timeout=2.0)
-        self.cap.release()
+            self.thread.join(timeout=0.5)
 
 
 def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, realtime: bool = True) -> None:
@@ -484,18 +496,18 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, re
         fps = 30.0
     print(f"Capture opened at {fps:.2f} FPS; OCR runs every {seconds_interval:.1f} seconds.")
 
-    # Wait up to 5 seconds for the first frame to arrive
-    live_cap.new_frame_event.wait(timeout=5.0)
+    # Wait up to 5 seconds for the first frame to arrive, checking stop_requested
+    t_first = time.monotonic() + 5.0
+    while time.monotonic() < t_first and not live_cap.new_frame_event.is_set():
+        if constants.stop_requested.is_set():
+            break
+        live_cap.new_frame_event.wait(timeout=0.05)
 
     sample_count: int = 0
     next_sample_at = time.monotonic()
     state_reducer = ocr.GameStateReducer()
 
-    while live_cap.isOpened():
-        if constants.stop_requested.is_set():
-            print("Stop requested; ending OCR job.")
-            break
-
+    while live_cap.isOpened() and not constants.stop_requested.is_set():
         if constants.reducer_reset_requested.is_set():
             state_reducer = ocr.GameStateReducer()
             ocr.reset_ocr_crop_cache()
@@ -598,6 +610,7 @@ def _run_local_video_job(path_to_video: str | None, seconds_interval: float, rea
         constants.preview_completed.set()
         constants.video_state.status = "idle"
         constants.video_state.message = "OCR video processing stopped"
+        constants.stop_requested.clear()
         if constants.video_state.last_error is None:
             publish_game_state_event("idle", "OCR video processing stopped")
         constants.video_state_lock.release()

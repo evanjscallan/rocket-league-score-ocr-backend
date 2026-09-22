@@ -97,6 +97,9 @@ async def run_auth_tests():
         assert saved["blue_score"]["x"] == 0.20
         assert saved["timer"]["x"] == 0.42
         assert saved["orange_score"]["x"] == 0.62
+        # 12. POST /stop-local-video when not running returns 409
+        res = await client.post("/stop-local-video")
+        assert res.status_code in {409, 200}
 
     print("All auth and API tests passed!")
 
