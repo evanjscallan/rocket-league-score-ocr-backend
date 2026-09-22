@@ -201,13 +201,14 @@ def refresh_preview_frame(
         if constants.video_state.status != "running":
             raise HTTPException(status_code=409, detail="The OCR video job stopped before preview refresh completed")
         with constants.preview_lock:
-            preview_jpeg = constants.latest_preview_jpeg
             preview_frame = constants.latest_preview_frame.copy() if constants.latest_preview_frame is not None else None
             metadata = constants.latest_preview_metadata
-        if preview_jpeg is None or preview_frame is None or metadata is None:
+        if preview_frame is None or metadata is None:
             raise HTTPException(status_code=503, detail="The preview refresh did not produce a frame")
         if mode == "threshold":
             preview_jpeg = ocr.encode_preview_jpeg(ocr.threshold_preview_frame(preview_frame, ocr.current_calibration()))
+        else:
+            preview_jpeg = ocr.encode_preview_jpeg(preview_frame)
         return Response(
             content=preview_jpeg,
             media_type="image/jpeg",
@@ -226,17 +227,31 @@ def get_preview_frame(
     mode: Literal["raw", "threshold"] = "raw",
     _: None = Depends(require_admin_session),
 ) -> Response:
-    """Return the latest authenticated raw or threshold preview JPEG."""
+    """Return the latest authenticated raw or threshold preview JPEG, capturing on demand if needed."""
     if constants.video_state.status not in {"running", "stopping"}:
         raise HTTPException(status_code=409, detail="No active OCR video job is available")
+
     with constants.preview_lock:
-        preview_jpeg = constants.latest_preview_jpeg
+        has_frame = constants.latest_preview_frame is not None
+
+    if not has_frame:
+        if constants.preview_request_lock.acquire(blocking=False):
+            try:
+                constants.preview_completed.clear()
+                constants.preview_requested.set()
+                constants.preview_completed.wait(timeout=3.0)
+            finally:
+                constants.preview_request_lock.release()
+
+    with constants.preview_lock:
         preview_frame = constants.latest_preview_frame.copy() if constants.latest_preview_frame is not None else None
         metadata = constants.latest_preview_metadata
-    if preview_jpeg is None or preview_frame is None or metadata is None:
-        raise HTTPException(status_code=409, detail="No preview frame is available")
+    if preview_frame is None or metadata is None:
+        raise HTTPException(status_code=409, detail="No preview frame is available yet; please retry in a moment")
     if mode == "threshold":
         preview_jpeg = ocr.encode_preview_jpeg(ocr.threshold_preview_frame(preview_frame, ocr.current_calibration()))
+    else:
+        preview_jpeg = ocr.encode_preview_jpeg(preview_frame)
     return Response(
         content=preview_jpeg,
         media_type="image/jpeg",
@@ -483,6 +498,7 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, re
 
         if constants.reducer_reset_requested.is_set():
             state_reducer = ocr.GameStateReducer()
+            ocr.reset_ocr_crop_cache()
             constants.reducer_reset_requested.clear()
 
         refresh_was_requested = constants.refresh_requested.is_set()
@@ -555,6 +571,7 @@ def _run_local_video_job(path_to_video: str | None, seconds_interval: float, rea
         constants.preview_requested.clear()
         constants.preview_completed.clear()
         constants.reducer_reset_requested.clear()
+        ocr.reset_ocr_crop_cache()
         with constants.preview_lock:
             constants.latest_preview_jpeg = None
             constants.latest_preview_metadata = None

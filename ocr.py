@@ -108,13 +108,12 @@ def threshold_preview_frame(frame: np.ndarray, calibration: OCRCalibration) -> n
 
 
 def cache_preview_frame(frame: np.ndarray) -> None:
-    """Cache the latest source frame, JPEG preview, and capture metadata."""
+    """Cache the latest source frame and capture metadata lazily."""
     frame_height, frame_width = frame.shape[:2]
-    preview_jpeg = encode_preview_jpeg(frame)
 
     with constants.preview_lock:
         constants.latest_preview_frame = frame.copy()
-        constants.latest_preview_jpeg = preview_jpeg
+        constants.latest_preview_jpeg = None
         constants.latest_preview_metadata = PreviewFrameMetadata(
             capture_id=constants.next_preview_capture_id,
             frame_width=frame_width,
@@ -122,7 +121,7 @@ def cache_preview_frame(frame: np.ndarray) -> None:
         )
         constants.next_preview_capture_id += 1
 
-    # Write latest normal vision and threshold vision frames to images directory if debug writes are enabled
+    # Write latest normal vision and threshold vision frames to images directory only if debug writes are enabled
     if DEBUG_IMAGE_WRITES:
         write_image(frame, "preview_normal")
         write_image(threshold_preview_frame(frame, current_calibration()), "preview_threshold")
@@ -241,8 +240,16 @@ def parse_time_string(time_str: str) -> tuple[int, int, bool] | None:
     return minutes, seconds, is_overtime
 
 
+_last_crop_cache: dict[str, tuple[np.ndarray, str | Literal["N/A"]]] = {}
+
+
+def reset_ocr_crop_cache() -> None:
+    """Clear cached crops for change detection."""
+    _last_crop_cache.clear()
+
+
 def determine_number(coordinates_img: np.ndarray, zone_name: str) -> str | Literal["N/A"]:
-    """Read and validate one score or clock value from a prepared crop."""
+    """Read and validate one score or clock value from a prepared crop with change detection."""
     padded_thresh: np.ndarray = preprocess_with_grayscale_kernel_thresh_and_padding(coordinates_img, zone_name)
     if zone_name.startswith("blue"):
         corrected_canvas = rotate_image_capture_bound_box(padded_thresh, BLUE_ROTATION)
@@ -252,7 +259,18 @@ def determine_number(coordinates_img: np.ndarray, zone_name: str) -> str | Liter
         corrected_canvas = padded_thresh
 
     clean_zone = zone_name.replace("-", "_")
-    write_image(corrected_canvas, f"{clean_zone}_thresh")
+    if DEBUG_IMAGE_WRITES:
+        write_image(corrected_canvas, f"{clean_zone}_thresh")
+
+    # Score change detection / crop diffing: skip Tesseract if score region has not changed
+    if zone_name.endswith("score") and zone_name in _last_crop_cache:
+        prev_canvas, prev_result = _last_crop_cache[zone_name]
+        if prev_canvas.shape == corrected_canvas.shape:
+            diff = cv2.absdiff(corrected_canvas, prev_canvas)
+            # Binary masks (0/255): mean diff < 1.0 indicates negligible pixel change
+            if cv2.mean(diff)[0] < 1.0:
+                return prev_result
+
     if zone_name.endswith("score"):
         contours: Sequence[MatLike]
         contours, _ = cv2.findContours(corrected_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -262,6 +280,7 @@ def determine_number(coordinates_img: np.ndarray, zone_name: str) -> str | Liter
                 _, _, w, h = cv2.boundingRect(largest_contour)
                 aspect_ratio: float = w / float(h)
                 if aspect_ratio < 0.38:
+                    _last_crop_cache[zone_name] = (corrected_canvas.copy(), "1")
                     return "1"
 
     detected_num: str = pytesseract.image_to_string(corrected_canvas, config=TESSERACT_CONFIG).strip()
@@ -278,21 +297,25 @@ def determine_number(coordinates_img: np.ndarray, zone_name: str) -> str | Liter
                 return f"{prefix}{digits[:2]}:{digits[2:]}"
         return "N/A"
     if result.isdigit() and 0 <= int(result) <= MAX_SCORE:
+        _last_crop_cache[zone_name] = (corrected_canvas.copy(), result)
         return result
+    _last_crop_cache[zone_name] = (corrected_canvas.copy(), "N/A")
     return "N/A"
 
 
 def get_coordinates(original_img: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract calibrated blue-score, orange-score, and timer image regions."""
     calibration = current_calibration()
-    write_image(original_img, "preview_normal")
-    write_image(threshold_preview_frame(original_img, calibration), "preview_threshold")
+    if DEBUG_IMAGE_WRITES:
+        write_image(original_img, "preview_normal")
+        write_image(threshold_preview_frame(original_img, calibration), "preview_threshold")
     blue_coordinates = normalized_crop(original_img, calibration.blue_score)
     orange_coordinates = normalized_crop(original_img, calibration.orange_score)
     time_coordinates = normalized_crop(original_img, calibration.time)
-    write_image(blue_coordinates, "blue_score_raw")
-    write_image(orange_coordinates, "orange_score_raw")
-    write_image(time_coordinates, "time_raw")
+    if DEBUG_IMAGE_WRITES:
+        write_image(blue_coordinates, "blue_score_raw")
+        write_image(orange_coordinates, "orange_score_raw")
+        write_image(time_coordinates, "time_raw")
     return blue_coordinates, orange_coordinates, time_coordinates
 
 def get_score(

@@ -30,13 +30,13 @@ FRONTEND_ORIGINS = os.getenv("FRONTEND_ORIGINS", "http://localhost:5173").split(
 DEFAULT_STREAM_URL: str | None = os.getenv("STREAM_URL")
 SAMPLE_INTERVAL_SECONDS: float = 3.0
 DEBUG_OCR: bool = os.getenv("DEBUG_OCR", "false").lower() in ("true", "1", "yes")
-DEBUG_IMAGE_WRITES: bool = os.getenv("DEBUG_IMAGE_WRITES", os.getenv("DEBUG_OCR", "true")).lower() in ("true", "1", "yes")
+DEBUG_IMAGE_WRITES: bool = os.getenv("DEBUG_IMAGE_WRITES", os.getenv("DEBUG_OCR", "false")).lower() in ("true", "1", "yes")
 PREFERRED_QUALITIES: tuple[str, ...] = tuple(
     [
         q.strip()
         for q in os.getenv(
             "PREFERRED_QUALITIES",
-            "480p30,480p,360p30,360p,720p30,720p,480p60,720p60,best",
+            "360p,360p30,480p,480p30,720p,720p30,best",
         ).split(",")
         if q.strip()
     ]
