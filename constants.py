@@ -1,5 +1,6 @@
 import threading
 from queue import Queue
+from typing import Any
 import numpy as np
 from models import (
     GameStateEvent,
@@ -41,3 +42,4 @@ next_preview_capture_id: int = 1
 active_stream_url: str | None = None
 
 video_state = VideoState()
+active_live_capture: Any = None

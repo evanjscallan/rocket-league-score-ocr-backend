@@ -76,6 +76,7 @@ def refresh_game_state() -> GameState:
         constants.refresh_completed.clear()
         constants.refresh_requested.set()
         if not constants.refresh_completed.wait(timeout=6):
+            constants.refresh_requested.clear()
             raise HTTPException(status_code=504, detail="Timed out waiting for an OCR refresh")
         if constants.video_state.status != "running":
             raise HTTPException(status_code=409, detail="The OCR video job stopped before it could refresh")
@@ -83,6 +84,7 @@ def refresh_game_state() -> GameState:
             game_state = constants.latest_event.game_state if constants.latest_event else None
             return game_state or GameState(score_state=ScoreState(), time_left=GameTimeState())
     finally:
+        constants.refresh_requested.clear()
         constants.refresh_request_lock.release()
 
 
@@ -196,8 +198,11 @@ def refresh_preview_frame(
     try:
         constants.preview_completed.clear()
         constants.preview_requested.set()
-        if not constants.preview_completed.wait(timeout=10):
-            raise HTTPException(status_code=504, detail="Timed out waiting for a preview frame")
+        if not constants.preview_completed.wait(timeout=6):
+            constants.preview_requested.clear()
+            with constants.preview_lock:
+                if constants.latest_preview_frame is None:
+                    raise HTTPException(status_code=504, detail="Timed out waiting for a preview frame")
         if constants.video_state.status != "running":
             raise HTTPException(status_code=409, detail="The OCR video job stopped before preview refresh completed")
         with constants.preview_lock:
@@ -220,6 +225,7 @@ def refresh_preview_frame(
             },
         )
     finally:
+        constants.preview_requested.clear()
         constants.preview_request_lock.release()
 
 @app.get("/preview-frame")
@@ -426,26 +432,32 @@ class LiveStreamCapture:
         return self.cap.get(prop)
 
     def _reader(self) -> None:
-        while self.running and not self.stopped and not constants.stop_requested.is_set() and self.cap.isOpened():
-            grabbed = self.cap.grab()
-            if not grabbed:
-                time.sleep(0.01)
-                continue
-            self.new_frame_event.set()
-            if self._decode_requested.is_set():
-                ret, frame = self.cap.retrieve()
-                with self.lock:
-                    self._retrieve_success = ret
-                    self._retrieved_frame = frame
+        try:
+            while self.running and not self.stopped and not constants.stop_requested.is_set() and self.cap.isOpened():
+                grabbed = self.cap.grab()
+                if not grabbed:
+                    time.sleep(0.01)
+                    continue
+                self.new_frame_event.set()
+                if self._decode_requested.is_set():
+                    ret, frame = self.cap.retrieve()
+                    with self.lock:
+                        self._retrieve_success = ret
+                        self._retrieved_frame = frame
+                    self._decode_requested.clear()
+                    self._decode_completed.set()
+                if self.frame_delay > 0:
+                    time.sleep(self.frame_delay)
+        finally:
+            with self.lock:
+                self.stopped = True
                 self._decode_requested.clear()
                 self._decode_completed.set()
-            if self.frame_delay > 0:
-                time.sleep(self.frame_delay)
-        with self.lock:
-            self.stopped = True
-            self._decode_requested.clear()
-            self._decode_completed.set()
-            self.new_frame_event.set()
+                self.new_frame_event.set()
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
     def read_latest(self, timeout: float = 2.0) -> tuple[bool, np.ndarray | None]:
         """Request and retrieve the freshest frame on demand."""
@@ -462,6 +474,9 @@ class LiveStreamCapture:
 
         if not self._decode_completed.is_set():
             self._decode_requested.clear()
+            with self.lock:
+                if self._retrieved_frame is not None:
+                    return True, self._retrieved_frame.copy()
             return False, None
         with self.lock:
             if not self._retrieve_success or self._retrieved_frame is None:
@@ -474,22 +489,25 @@ class LiveStreamCapture:
         self._decode_requested.clear()
         self._decode_completed.set()
         self.new_frame_event.set()
-        try:
-            self.cap.release()
-        except Exception:
-            pass
-        if self.thread.is_alive():
-            self.thread.join(timeout=0.5)
+        if self.thread.is_alive() and threading.current_thread() != self.thread:
+            self.thread.join(timeout=1.0)
+        if not self.thread.is_alive():
+            try:
+                self.cap.release()
+            except Exception:
+                pass
 
 
 def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, realtime: bool = True) -> None:
     """Capture frames, service refresh requests, and publish stabilized OCR state."""
     print(f"\n--- Testing Video File: {path_to_video} ---")
     live_cap = LiveStreamCapture(path_to_video if path_to_video else 0)
+    constants.active_live_capture = live_cap
 
     if not live_cap.isOpened():
         print("Could not open video.")
-        return
+        live_cap.release()
+        raise RuntimeError(f"Could not open video stream: {path_to_video}")
 
     fps: float = live_cap.get(cv2.CAP_PROP_FPS)
     if not fps or fps <= 0:
@@ -561,8 +579,9 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, re
                     print(f"🏆 GAME OVER: {latest_result.winner} Team Wins ({latest_result.score_state.blue_score} - {latest_result.score_state.orange_score})!")
                     print("=" * 45)
                 print(f"OCR sample {sample_count} completed in {time.monotonic() - t0:.2f} seconds.")
-                event_msg = f"Game Over - {latest_result.winner} Team Wins!" if latest_result.is_game_over and latest_result.winner else "OCR update received"
-                publish_game_state_event("running", event_msg, latest_result)
+                if not constants.stop_requested.is_set():
+                    event_msg = f"Game Over - {latest_result.winner} Team Wins!" if latest_result.is_game_over and latest_result.winner else "OCR update received"
+                    publish_game_state_event("running", event_msg, latest_result)
             except Exception as exc:
                 if constants.stop_requested.is_set():
                     break
@@ -608,12 +627,16 @@ def _run_local_video_job(path_to_video: str | None, seconds_interval: float, rea
             constants.latest_preview_metadata = None
         constants.refresh_completed.set()
         constants.preview_completed.set()
+        constants.active_live_capture = None
+        constants.stop_requested.clear()
         constants.video_state.status = "idle"
         constants.video_state.message = "OCR video processing stopped"
-        constants.stop_requested.clear()
         if constants.video_state.last_error is None:
             publish_game_state_event("idle", "OCR video processing stopped")
-        constants.video_state_lock.release()
+        try:
+            constants.video_state_lock.release()
+        except RuntimeError:
+            pass
 
 
 @app.post("/run-local-video")
