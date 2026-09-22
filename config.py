@@ -74,10 +74,17 @@ def publish_game_state_event(
     status: Literal["queued", "running", "completed", "failed", "idle", "stopping"],
     message: str,
     game_state=None,
+    stream_url: str | None = None,
+    controls_locked: bool | None = None,
 ) -> None:
     """Store and broadcast a game-state lifecycle event to SSE subscribers."""
     import constants
     from models import GameStateEvent
+
+    if stream_url is None:
+        stream_url = str(constants.active_stream_url or "")
+    if controls_locked is None:
+        controls_locked = bool(getattr(constants, "controls_locked", False))
 
     with constants.event_lock:
         event = GameStateEvent(
@@ -86,6 +93,8 @@ def publish_game_state_event(
             status=status,
             message=message,
             game_state=game_state,
+            stream_url=stream_url,
+            controls_locked=controls_locked,
         )
         constants.next_event_id += 1
         constants.latest_event = event

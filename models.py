@@ -15,6 +15,8 @@ class VideoState(BaseModel):
     path_to_video: str | None = None
     seconds_interval: float | None = 3.0
     realtime: bool | None = True
+    stream_url: str | None = None
+    controls_locked: bool | None = None
     run_count: int = Field(default=0, exclude=True)
     last_error: str | None = Field(default=None, exclude=True)
 
@@ -133,3 +135,5 @@ class GameStateEvent(BaseModel):
     status: VideoJobStatus
     message: str
     game_state: GameState | None = None
+    stream_url: str | None = None
+    controls_locked: bool | None = None

@@ -112,6 +112,8 @@ def stop_local_video() -> VideoState:
 def get_video_state() -> VideoState:
     """Return the current OCR video job status and configuration."""
     constants.video_state.message = f"OCR video status is {constants.video_state.status}"
+    constants.video_state.stream_url = constants.active_stream_url
+    constants.video_state.controls_locked = bool(getattr(constants, "controls_locked", False))
     return constants.video_state
 
 
@@ -125,6 +127,14 @@ def get_controls_lock() -> dict[str, bool]:
 def update_controls_lock(payload: dict[str, bool]) -> dict[str, bool]:
     """Update viewer controls lock state."""
     constants.controls_locked = bool(payload.get("locked", False))
+    with constants.event_lock:
+        game_state = constants.latest_event.game_state if constants.latest_event else None
+    publish_game_state_event(
+        status=cast(VideoJobStatus, constants.video_state.status),
+        message=f"Controls lock {'enabled' if constants.controls_locked else 'disabled'}",
+        game_state=game_state,
+        controls_locked=constants.controls_locked,
+    )
     return {"locked": constants.controls_locked}
 
 
@@ -185,6 +195,14 @@ def update_stream_url(payload: StreamUrlRequest) -> dict[str, str]:
     """Update the active stream/video URL submitted from the frontend."""
     if payload.stream_url and payload.stream_url.strip():
         constants.active_stream_url = payload.stream_url.strip()
+        with constants.event_lock:
+            game_state = constants.latest_event.game_state if constants.latest_event else None
+        publish_game_state_event(
+            status=cast(VideoJobStatus, constants.video_state.status),
+            message="Stream URL updated",
+            game_state=game_state,
+            stream_url=constants.active_stream_url,
+        )
     return {
         "stream_url": str(constants.active_stream_url or ""),
         "message": "Stream URL updated successfully",
@@ -292,6 +310,10 @@ async def game_state_events(request: Request) -> StreamingResponse:
     with constants.event_lock:
         constants.event_subscribers.add(subscriber)
         if constants.latest_event:
+            if constants.latest_event.stream_url is None:
+                constants.latest_event.stream_url = constants.active_stream_url
+            if constants.latest_event.controls_locked is None:
+                constants.latest_event.controls_locked = bool(getattr(constants, "controls_locked", False))
             initial_event = constants.latest_event.model_dump_json(exclude_none=True)
         else:
             initial_event = GameStateEvent(
@@ -300,6 +322,8 @@ async def game_state_events(request: Request) -> StreamingResponse:
                 status=cast(VideoJobStatus, constants.video_state.status),
                 message=constants.video_state.message,
                 game_state=GameState(score_state=ScoreState(), time_left=GameTimeState()),
+                stream_url=constants.active_stream_url,
+                controls_locked=bool(getattr(constants, "controls_locked", False)),
             ).model_dump_json(exclude_none=True)
 
     async def event_stream():
