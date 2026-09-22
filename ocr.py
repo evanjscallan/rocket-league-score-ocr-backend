@@ -439,7 +439,7 @@ class ClockTracker:
     def _is_consistent(self, base_sec: int, base_ot: bool, new_sec: int, new_ot: bool, elapsed_wall: float) -> bool:
         """Check if new_sec is a plausible continuation from base_sec after elapsed_wall seconds."""
         if base_ot != new_ot:
-            if not base_ot and new_ot and base_sec <= 5 and new_sec <= 5:
+            if not base_ot and new_ot and base_sec <= 5 and new_sec <= 15:
                 return True
             return False
 
@@ -512,6 +512,7 @@ class GameStateReducer:
         self.is_game_over: bool = False
         self.game_over_sample_count: int = 0
         self.low_time_first_seen: float | None = None
+        self.overtime_start_scores: tuple[int, int] | None = None
 
     def reset(self) -> None:
         """Reset all tracked match state for a fresh game."""
@@ -521,6 +522,7 @@ class GameStateReducer:
         self.is_game_over = False
         self.game_over_sample_count = 0
         self.low_time_first_seen = None
+        self.overtime_start_scores = None
 
     def update(
         self,
@@ -550,27 +552,60 @@ class GameStateReducer:
         b, o = self.score_tracker.update(blue_score, orange_score)
         sec, ot = self.clock_tracker.update(clock_sec, is_ot)
 
-        # Track low-time (< 10s) duration in regulation
-        if not ot and sec is not None and sec <= 10:
-            if self.low_time_first_seen is None:
-                self.low_time_first_seen = now
-        elif sec is not None and sec > 10:
+        if ot:
+            # Overtime is active: reset regulation low-time tracking
             self.low_time_first_seen = None
 
-        # Check for Rocket League Game Over / Winner conditions:
-        if not self.is_game_over and b is not None and o is not None:
-            # 1. Regulation End: Clock reaches 0:00 (or <= 0:01) with non-tied scores
-            if not ot and sec is not None and sec <= 1 and b != o:
-                self.is_game_over = True
-                self.winner = "Blue" if b > o else "Orange"
-            # 2. Low-time condition: Clock under 10 seconds for more than 30 seconds
-            elif not ot and self.low_time_first_seen is not None and (now - self.low_time_first_seen >= 30.0) and b != o:
-                self.is_game_over = True
-                self.winner = "Blue" if b > o else "Orange"
-            # 3. Overtime End (Sudden Death): Overtime mode and one team leads
-            elif ot and b != o:
-                self.is_game_over = True
-                self.winner = "Blue" if b > o else "Orange"
+            # Capture initial overtime score baseline on entry
+            if self.overtime_start_scores is None and b is not None and o is not None:
+                self.overtime_start_scores = (b, o)
+
+            # If the game was prematurely marked game-over at regulation 0:00, cancel it
+            if self.is_game_over:
+                if self.overtime_start_scores is not None:
+                    init_b, init_o = self.overtime_start_scores
+                    # Only stay game over if a golden goal was actually scored from the OT baseline
+                    if not ((b is not None and b > init_b and b > (o or 0)) or (o is not None and o > init_o and o > (b or 0))):
+                        self.is_game_over = False
+                        self.winner = None
+                else:
+                    self.is_game_over = False
+                    self.winner = None
+
+            # Check for Overtime Sudden Death Winner:
+            if not self.is_game_over and b is not None and o is not None:
+                if self.overtime_start_scores is not None:
+                    init_b, init_o = self.overtime_start_scores
+                    if b > init_b and b > o:
+                        self.is_game_over = True
+                        self.winner = "Blue"
+                    elif o > init_o and o > b:
+                        self.is_game_over = True
+                        self.winner = "Orange"
+                    elif init_b == init_o and b != o:
+                        self.is_game_over = True
+                        self.winner = "Blue" if b > o else "Orange"
+        else:
+            # Regulation Mode
+            self.overtime_start_scores = None
+
+            # Track low-time (< 10s) duration in regulation
+            if sec is not None and sec <= 10:
+                if self.low_time_first_seen is None:
+                    self.low_time_first_seen = now
+            elif sec is not None and sec > 10:
+                self.low_time_first_seen = None
+
+            # Check for Regulation Game Over / Winner conditions:
+            if not self.is_game_over and b is not None and o is not None:
+                # 1. Regulation End: Clock reaches 0:00 (or <= 0:01) with non-tied scores
+                if sec is not None and sec <= 1 and b != o:
+                    self.is_game_over = True
+                    self.winner = "Blue" if b > o else "Orange"
+                # 2. Low-time condition: Clock under 10 seconds for more than 30 seconds
+                elif self.low_time_first_seen is not None and (now - self.low_time_first_seen >= 30.0) and b != o:
+                    self.is_game_over = True
+                    self.winner = "Blue" if b > o else "Orange"
 
         return GameState(
             score_state=ScoreState(blue_score=b, orange_score=o),

@@ -101,5 +101,38 @@ async def run_auth_tests():
     print("All auth and API tests passed!")
 
 
+def test_overtime_reducer():
+    from ocr import GameStateReducer
+
+    reducer = GameStateReducer()
+
+    # 1. Regulation ends 1-1 at 0:00
+    state = reducer.update(1, 1, (0, False))
+    assert not state.is_game_over
+    assert state.winner is None
+
+    # 2. Premature 0:00 anomaly (e.g. 2-1 for 1 second)
+    state = reducer.update(2, 1, (0, False))
+    # It might think game over at 0:00 with unequal scores
+    # 3. Stream transitions into overtime (+0:02)
+    state = reducer.update(2, 1, (2, True))
+    # Entering overtime must cancel premature game over!
+    assert not state.is_game_over
+    assert state.winner is None
+    assert state.time_left.is_overtime
+
+    # 4. Overtime progresses (+0:15) with same score
+    state = reducer.update(2, 1, (15, True))
+    assert not state.is_game_over
+    assert state.winner is None
+
+    # 5. Blue scores sudden death golden goal (3-1)
+    state = reducer.update(3, 1, (20, True))
+    assert state.is_game_over
+    assert state.winner == "Blue"
+    print("Overtime reducer tests passed!")
+
+
 if __name__ == "__main__":
     asyncio.run(run_auth_tests())
+    test_overtime_reducer()
