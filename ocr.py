@@ -10,17 +10,24 @@ from fastapi import HTTPException
 import numpy as np
 import pytesseract
 
+from pathlib import Path
 from auth import decode_base64, encode_base64
 from config import (
     ANOMALY_CONFIRMATIONS,
     BLUE_ROTATION,
+    BURST_SAMPLE_COUNT,
+    BURST_SAMPLE_DELAY,
     DEBUG_IMAGE_WRITES,
     IMAGES_DIR,
     MAX_SCORE,
+    MIN_OCR_CONFIDENCE,
     ORANGE_ROTATION,
     PREFERRED_QUALITIES,
     SAMPLE_CLOCK_TOLERANCE_SECONDS,
+    TEMPLATES_DIR,
     TESSERACT_CONFIG,
+    TESSERACT_SCORE_CONFIG,
+    TESSERACT_TIME_CONFIG,
     TIME_DIGITS_PATTERN,
     TIME_PATTERN,
 )
@@ -96,12 +103,16 @@ def threshold_preview_frame(frame: np.ndarray, calibration: OCRCalibration) -> n
         if zone_name.endswith("score"):
             hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
             lower_bound = np.array([0, 0, 180], dtype=np.uint8)
-            upper_bound = np.array([179, 100, 255], dtype=np.uint8)
+            upper_bound = np.array([179, 145, 255], dtype=np.uint8)
             threshold = cv2.inRange(hsv, lower_bound, upper_bound)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            threshold = cv2.morphologyEx(threshold, cv2.MORPH_CLOSE, kernel)
         else:
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
             blurred_gray = cv2.GaussianBlur(gray, (3, 3), 0)
             _, threshold = cv2.threshold(blurred_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            threshold = cv2.morphologyEx(threshold, cv2.MORPH_CLOSE, kernel)
         threshold_preview[y1:y2, x1:x2] = cv2.cvtColor(threshold, cv2.COLOR_GRAY2BGR)
 
     return threshold_preview 
@@ -153,14 +164,21 @@ def preprocess_with_grayscale_kernel_thresh_and_padding(coordinates_img, zone_na
     if zone_name.endswith("score"):
         hsv = cv2.cvtColor(coordinates_img, cv2.COLOR_BGR2HSV)
         lower_bound = np.array([0, 0, 180], dtype=np.uint8)
-        upper_bound = np.array([179, 100, 255], dtype=np.uint8)
+        # Blue background has S ~ 140-160; Orange background has S ~ 170-190
+        # Use S <= 100 for blue, and S <= 120 for orange to ensure clean isolation
+        max_s = 100 if zone_name.startswith("blue") else 120
+        upper_bound = np.array([179, max_s, 255], dtype=np.uint8)
         thresh = cv2.inRange(hsv, lower_bound, upper_bound)
         thresh = cv2.resize(thresh, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
     else:
         gray = cv2.cvtColor(coordinates_img, cv2.COLOR_BGR2GRAY)
         enlarged_gray = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         blurred_gray = cv2.GaussianBlur(enlarged_gray, (3, 3), 0)
         _, thresh = cv2.threshold(blurred_gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
 
     padded_thresh = cv2.copyMakeBorder(
         thresh,
@@ -174,6 +192,148 @@ def preprocess_with_grayscale_kernel_thresh_and_padding(coordinates_img, zone_na
     return padded_thresh
 
 
+def clean_and_center_digit(canvas: np.ndarray) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """Isolate primary digit contours, eliminate noise specks, and return (tight_crop, padded_canvas)."""
+    contours, _ = cv2.findContours(canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    valid_contours = [c for c in contours if cv2.contourArea(c) > 20]
+    if not valid_contours:
+        return None, None
+
+    clean = np.zeros_like(canvas)
+    for c in valid_contours:
+        cv2.drawContours(clean, [c], -1, 255, -1)
+    clean = cv2.bitwise_and(canvas, clean)
+
+    x_min = min(cv2.boundingRect(c)[0] for c in valid_contours)
+    y_min = min(cv2.boundingRect(c)[1] for c in valid_contours)
+    x_max = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in valid_contours)
+    y_max = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in valid_contours)
+
+    tight = clean[y_min:y_max, x_min:x_max]
+    padded = cv2.copyMakeBorder(tight, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=0)
+    return tight, padded
+
+
+def clean_and_center_timer(canvas: np.ndarray) -> np.ndarray:
+    """Filter out noise and extraneous HUD geometry below the timer text line."""
+    contours, _ = cv2.findContours(canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    text_contours = [c for c in contours if cv2.contourArea(c) >= 8 and cv2.boundingRect(c)[1] < canvas.shape[0] * 0.70]
+    if not text_contours:
+        return canvas
+
+    clean = np.zeros_like(canvas)
+    for c in text_contours:
+        cv2.drawContours(clean, [c], -1, 255, -1)
+    clean = cv2.bitwise_and(canvas, clean)
+
+    x_min = min(cv2.boundingRect(c)[0] for c in text_contours)
+    y_min = min(cv2.boundingRect(c)[1] for c in text_contours)
+    x_max = max(cv2.boundingRect(c)[0] + cv2.boundingRect(c)[2] for c in text_contours)
+    y_max = max(cv2.boundingRect(c)[1] + cv2.boundingRect(c)[3] for c in text_contours)
+
+    tight = clean[y_min:y_max, x_min:x_max]
+    return cv2.copyMakeBorder(tight, 12, 12, 12, 12, cv2.BORDER_CONSTANT, value=0)
+
+
+class TemplateMatcher:
+    """Sub-millisecond normalized cross-correlation template matching for fixed HUD digits."""
+
+    def __init__(self, templates_dir: Path | str = TEMPLATES_DIR) -> None:
+        self.templates_dir = Path(templates_dir)
+        self.templates: dict[str, np.ndarray] = {}
+        self.reload()
+
+    def reload(self) -> None:
+        """Reload reference digit templates from the templates directory."""
+        self.templates.clear()
+        if not self.templates_dir.exists():
+            return
+        for file in self.templates_dir.glob("*.png"):
+            digit = file.stem
+            img = cv2.imread(str(file), cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                self.templates[digit] = img
+
+    def match(self, crop_bin: np.ndarray, min_score: float = 0.85) -> tuple[str, float] | None:
+        """Match a binary digit crop against known digit templates."""
+        if not self.templates:
+            return None
+        h, w = crop_bin.shape[:2]
+        if h < 10 or w < 4:
+            return None
+
+        scale = 60.0 / h
+        target_w = max(4, int(w * scale))
+        norm = cv2.resize(crop_bin, (target_w, 60), interpolation=cv2.INTER_AREA)
+        _, norm_bin = cv2.threshold(norm, 127, 255, cv2.THRESH_BINARY)
+
+        best_score = -1.0
+        best_digit = None
+        for digit, tmpl in self.templates.items():
+            tw = tmpl.shape[1]
+            nw = norm_bin.shape[1]
+            max_w = max(tw, nw)
+            pad_t = cv2.copyMakeBorder(
+                tmpl, 5, 5, 5 + (max_w - tw) // 2, 5 + (max_w - tw + 1) // 2, cv2.BORDER_CONSTANT, value=0
+            )
+            pad_n = cv2.copyMakeBorder(
+                norm_bin, 5, 5, 5 + (max_w - nw) // 2, 5 + (max_w - nw + 1) // 2, cv2.BORDER_CONSTANT, value=0
+            )
+            res = cv2.matchTemplate(pad_n, pad_t, cv2.TM_CCOEFF_NORMED)
+            score = float(cv2.minMaxLoc(res)[1])
+            if score > best_score:
+                best_score = score
+                best_digit = digit
+
+        if best_digit is not None and best_score >= min_score:
+            return best_digit, best_score
+        return None
+
+    def auto_save_template(self, digit: str, crop_bin: np.ndarray) -> None:
+        """Cache a verified high-confidence detection as a template."""
+        if digit in self.templates or not digit.isdigit():
+            return
+        h, w = crop_bin.shape[:2]
+        if h < 10 or w < 4:
+            return
+        try:
+            scale = 60.0 / h
+            target_w = max(4, int(w * scale))
+            norm = cv2.resize(crop_bin, (target_w, 60), interpolation=cv2.INTER_AREA)
+            _, norm_bin = cv2.threshold(norm, 127, 255, cv2.THRESH_BINARY)
+            cv2.imwrite(str(self.templates_dir / f"{digit}.png"), norm_bin)
+            self.templates[digit] = norm_bin
+        except Exception:
+            pass
+
+
+template_matcher = TemplateMatcher()
+
+
+def ocr_with_confidence(image: np.ndarray, config: str) -> tuple[str, float]:
+    """Run Tesseract and return recognized text alongside average token confidence."""
+    try:
+        data = pytesseract.image_to_data(image, config=config, output_type=pytesseract.Output.DICT)
+        texts = []
+        confs = []
+        for i in range(len(data.get("text", []))):
+            t = data["text"][i].strip()
+            if t:
+                texts.append(t)
+                try:
+                    c = float(data["conf"][i])
+                    if c >= 0:
+                        confs.append(c)
+                except (ValueError, TypeError):
+                    pass
+        text_str = "".join(texts).strip()
+        avg_conf = sum(confs) / len(confs) if confs else 0.0
+        return text_str, avg_conf
+    except Exception:
+        text_str = pytesseract.image_to_string(image, config=config).strip()
+        return text_str, 50.0
+
+
 def write_image(coordinates_img: np.ndarray | None, zone_name: str) -> None:
     """Write an OCR debug/preview image to the backend/images directory if enabled."""
     if not DEBUG_IMAGE_WRITES or coordinates_img is None:
@@ -185,24 +345,54 @@ def write_image(coordinates_img: np.ndarray | None, zone_name: str) -> None:
     except Exception as exc:
         print(f"Failed to write image {zone_name}: {exc}")
 
+
 def process_similar_numbers(detected_num: str | None, corrected_canvas: np.ndarray) -> str | Literal["N/A"]:
-    """Apply shape heuristics to distinguish commonly confused OCR digits."""
-    if detected_num in ["5", "4", "7"]:
-        upscaled_thresh: np.ndarray = cv2.resize(corrected_canvas, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-        contours, _ = cv2.findContours(upscaled_thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest_contour: np.ndarray = max(contours, key=cv2.contourArea)
-            x, y, w, h = cv2.boundingRect(largest_contour)
-            digit_crop: np.ndarray = upscaled_thresh[y : y + h, x : x + w]
-            aspect_ratio: float = w / float(h)
-            if detected_num == "4" and aspect_ratio < 0.45:
-                return "1"
-            if detected_num == "5":
-                half_h = h // 2
-                top_half_density = cv2.countNonZero(digit_crop[0:half_h, :])
-                bottom_half_density = cv2.countNonZero(digit_crop[half_h:h, :])
-                if top_half_density > bottom_half_density * 1.25:
-                    return "7"
+    """Apply topology and shape heuristics to distinguish commonly confused OCR digits."""
+    if not detected_num:
+        return "N/A"
+
+    contours, hierarchy = cv2.findContours(corrected_canvas, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    valid_contours = [c for c in contours if cv2.contourArea(c) > 20]
+    if not valid_contours:
+        return detected_num if detected_num.isdigit() else "N/A"
+
+    largest_contour = max(valid_contours, key=cv2.contourArea)
+    x, y, w, h = cv2.boundingRect(largest_contour)
+    aspect_ratio: float = w / float(max(1, h))
+
+    # Count internal holes (Euler characteristic / topology)
+    holes = 0
+    if hierarchy is not None:
+        for i in range(len(contours)):
+            if hierarchy[0][i][3] >= 0 and cv2.contourArea(contours[i]) > 25:
+                holes += 1
+
+    # 1. 0 vs 8 discrimination: '8' has 2 holes; '0' has 1 hole
+    if detected_num in ("0", "8"):
+        if holes >= 2:
+            return "8"
+        if holes == 1:
+            half_h = h // 2
+            mid_slice = corrected_canvas[y + half_h - 2 : y + half_h + 3, x + int(w * 0.35) : x + int(w * 0.65)]
+            if mid_slice.size > 0 and cv2.countNonZero(mid_slice) > (mid_slice.size * 0.5):
+                return "8"
+            return "0"
+
+    # 2. 1 vs 4 / 7 discrimination: '1' is narrow (aspect ratio < 0.45) with 0 holes
+    if detected_num in ("1", "4", "7"):
+        if aspect_ratio < 0.45 and holes == 0:
+            return "1"
+        if detected_num == "1" and (aspect_ratio >= 0.48 or holes > 0):
+            if holes == 1:
+                return "4"
+        if detected_num == "5":
+            digit_crop = corrected_canvas[y : y + h, x : x + w]
+            half_h = h // 2
+            top_half_density = cv2.countNonZero(digit_crop[0:half_h, :])
+            bottom_half_density = cv2.countNonZero(digit_crop[half_h:h, :])
+            if top_half_density > bottom_half_density * 1.25:
+                return "7"
+
     return detected_num if detected_num else "N/A"
 
 
@@ -272,34 +462,52 @@ def determine_number(coordinates_img: np.ndarray, zone_name: str) -> str | Liter
                 return prev_result
 
     if zone_name.endswith("score"):
-        contours: Sequence[MatLike]
-        contours, _ = cv2.findContours(corrected_canvas, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if contours:
-            largest_contour: np.ndarray = max(contours, key=cv2.contourArea)
-            if cv2.contourArea(largest_contour) > 15:
-                _, _, w, h = cv2.boundingRect(largest_contour)
-                aspect_ratio: float = w / float(h)
-                if aspect_ratio < 0.38:
-                    _last_crop_cache[zone_name] = (corrected_canvas.copy(), "1")
-                    return "1"
+        # 1. Clean and tightly center the score digit
+        tight_digit, padded_canvas = clean_and_center_digit(corrected_canvas)
+        if tight_digit is None or padded_canvas is None:
+            _last_crop_cache[zone_name] = (corrected_canvas.copy(), "N/A")
+            return "N/A"
 
-    detected_num: str = pytesseract.image_to_string(corrected_canvas, config=TESSERACT_CONFIG).strip()
-    result: str = process_similar_numbers(detected_num, corrected_canvas)
-    if zone_name == "time":
-        if TIME_PATTERN.fullmatch(result):
+        # 2. High-speed Template Matching on tight crop (sub-millisecond)
+        matched = template_matcher.match(tight_digit, min_score=0.85)
+        if matched is not None:
+            digit, score = matched
+            _last_crop_cache[zone_name] = (corrected_canvas.copy(), digit)
+            return digit
+
+        # 3. Tesseract OCR with dedicated score configuration (PSM 8)
+        detected_num, conf = ocr_with_confidence(padded_canvas, config=TESSERACT_SCORE_CONFIG)
+        if not detected_num:
+            detected_num, conf = ocr_with_confidence(padded_canvas, config=TESSERACT_CONFIG)
+
+        # 4. Topology and shape heuristics
+        result = process_similar_numbers(detected_num, padded_canvas)
+
+        if result.isdigit() and 0 <= int(result) <= MAX_SCORE:
+            if conf >= 90:
+                template_matcher.auto_save_template(result, tight_digit)
+            _last_crop_cache[zone_name] = (corrected_canvas.copy(), result)
             return result
-        if TIME_DIGITS_PATTERN.fullmatch(result):
-            digits = result.lstrip("+")
-            prefix = "+" if result.startswith("+") else ""
-            if len(digits) == 3:
-                return f"{prefix}{digits[0]}:{digits[1:]}"
-            if len(digits) == 4:
-                return f"{prefix}{digits[:2]}:{digits[2:]}"
+
+        _last_crop_cache[zone_name] = (corrected_canvas.copy(), "N/A")
         return "N/A"
-    if result.isdigit() and 0 <= int(result) <= MAX_SCORE:
-        _last_crop_cache[zone_name] = (corrected_canvas.copy(), result)
+
+    # Time zone processing: clean and center clock contours
+    cleaned_time_canvas = clean_and_center_timer(corrected_canvas)
+    detected_time, conf = ocr_with_confidence(cleaned_time_canvas, config=TESSERACT_TIME_CONFIG)
+    if not detected_time:
+        detected_time, conf = ocr_with_confidence(cleaned_time_canvas, config=TESSERACT_CONFIG)
+
+    result = detected_time.strip()
+    if TIME_PATTERN.fullmatch(result):
         return result
-    _last_crop_cache[zone_name] = (corrected_canvas.copy(), "N/A")
+    if TIME_DIGITS_PATTERN.fullmatch(result):
+        digits = result.lstrip("+")
+        prefix = "+" if result.startswith("+") else ""
+        if len(digits) == 3:
+            return f"{prefix}{digits[0]}:{digits[1:]}"
+        if len(digits) == 4:
+            return f"{prefix}{digits[:2]}:{digits[2:]}"
     return "N/A"
 
 
@@ -652,6 +860,43 @@ def get_ocr_result(
     blue_score_result = blue_score.blue_score if isinstance(blue_score.blue_score, int) else None
     orange_score_result = orange_score.orange_score if isinstance(orange_score.orange_score, int) else None
     return blue_score_result, orange_score_result, formatted_time
+
+
+def consensus_voting(
+    samples: Sequence[tuple[int | None, int | None, tuple[int | None | Literal["xx"], int | None | Literal["xx"], bool]]],
+) -> tuple[int | None, int | None, tuple[int | None | Literal["xx"], int | None | Literal["xx"], bool]]:
+    """Determine the consensus blue score, orange score, and clock state from a sample burst."""
+    if not samples:
+        return None, None, (None, None, False)
+    if len(samples) == 1:
+        return samples[0]
+
+    # Vote on blue score
+    blue_votes = [s[0] for s in samples if s[0] is not None]
+    consensus_blue = Counter(blue_votes).most_common(1)[0][0] if blue_votes else None
+
+    # Vote on orange score
+    orange_votes = [s[1] for s in samples if s[1] is not None]
+    consensus_orange = Counter(orange_votes).most_common(1)[0][0] if orange_votes else None
+
+    # Vote on time (parse valid clocks into seconds)
+    clock_votes = []
+    for s in samples:
+        parsed = parse_detected_time(s[2])
+        if parsed is not None:
+            clock_votes.append(parsed)
+
+    if clock_votes:
+        consensus_clock = Counter(clock_votes).most_common(1)[0][0]
+        consensus_time: tuple[int | None | Literal["xx"], int | None | Literal["xx"], bool] = (
+            consensus_clock[0],
+            consensus_clock[1],
+            consensus_clock[2],
+        )
+    else:
+        consensus_time = samples[-1][2]
+
+    return consensus_blue, consensus_orange, consensus_time
 
 
 def resolve_stream_url(stream_url: str) -> str:

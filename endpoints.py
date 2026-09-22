@@ -15,6 +15,8 @@ from numpy.typing import NDArray
 
 from auth import create_admin_session_token, is_valid_admin_credentials, require_admin_session
 from config import (
+    BURST_SAMPLE_COUNT,
+    BURST_SAMPLE_DELAY,
     COOKIE_SAMESITE,
     COOKIE_SECURE,
     FRONTEND_ORIGINS,
@@ -560,7 +562,17 @@ def run_local_video(path_to_video: str | None, seconds_interval: float = 3.0, re
             t0 = time.monotonic()
             print(f"Starting OCR sample {sample_count} at {time.strftime('%H:%M:%S')}.")
             try:
-                blue_score_results, orange_score_results, detected_time = ocr.get_ocr_result(frame)
+                # Capture burst frames and run consensus voting to eliminate single-frame glitches
+                burst_results = [ocr.get_ocr_result(frame)]
+                for _ in range(max(0, BURST_SAMPLE_COUNT - 1)):
+                    if constants.stop_requested.is_set():
+                        break
+                    time.sleep(BURST_SAMPLE_DELAY)
+                    ret_burst, frame_burst = live_cap.read_latest(timeout=0.1)
+                    if ret_burst and frame_burst is not None:
+                        burst_results.append(ocr.get_ocr_result(frame_burst))
+
+                blue_score_results, orange_score_results, detected_time = ocr.consensus_voting(burst_results)
                 latest_result = state_reducer.update(
                     blue_score_results,
                     orange_score_results,

@@ -36,7 +36,7 @@ PREFERRED_QUALITIES: tuple[str, ...] = tuple(
         q.strip()
         for q in os.getenv(
             "PREFERRED_QUALITIES",
-            "360p,360p30,480p,480p30,720p,720p30,best",
+            "720p60,720p,1080p60,1080p,best,480p,480p30,360p,360p30",
         ).split(",")
         if q.strip()
     ]
@@ -47,9 +47,18 @@ ASSET_DIRECTORY: Path = BASE_DIR.parent / "test-assets"
 ASSET_DIRECTORY.mkdir(parents=True, exist_ok=True)
 IMAGES_DIR: Path = BASE_DIR / "images"
 IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATES_DIR: Path = BASE_DIR / "templates"
+TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
 TESSDATA_DIR = BASE_DIR
 CUSTOM_DIGITS_PATH = TESSDATA_DIR / "custom_digits.traineddata"
 TESSERACT_CONFIG = f'--tessdata-dir "{TESSDATA_DIR}" -l custom_digits --psm 7 -c tessedit_char_whitelist=0123456789:+'
+TESSERACT_SCORE_CONFIG = f'--tessdata-dir "{TESSDATA_DIR}" -l custom_digits --psm 8 -c tessedit_char_whitelist=0123456789'
+TESSERACT_TIME_CONFIG = f'--tessdata-dir "{TESSDATA_DIR}" -l custom_digits --psm 7 -c tessedit_char_whitelist=0123456789:+'
+
+# Sampling & Confidence Settings
+MIN_OCR_CONFIDENCE: int = int(os.getenv("MIN_OCR_CONFIDENCE", "60"))
+BURST_SAMPLE_COUNT: int = int(os.getenv("BURST_SAMPLE_COUNT", "3"))
+BURST_SAMPLE_DELAY: float = float(os.getenv("BURST_SAMPLE_DELAY", "0.05"))
 
 # OCR & Game Constants
 BLUE_ROTATION: float = -4.0

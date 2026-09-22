@@ -136,6 +136,41 @@ def test_overtime_reducer():
     print("Overtime reducer tests passed!")
 
 
+def test_ocr_accuracy():
+    import cv2
+    import ocr
+
+    ocr.reset_ocr_crop_cache()
+
+    # 1. Real image OCR test
+    img_b = cv2.imread("images/blue_score_raw.png")
+    img_o = cv2.imread("images/orange_score_raw.png")
+    img_t = cv2.imread("images/time_raw.png")
+
+    assert img_b is not None and img_o is not None and img_t is not None
+    assert ocr.determine_number(img_b, "blue-score") == "1"
+    assert ocr.determine_number(img_o, "orange-score") == "0"
+    assert ocr.determine_number(img_t, "time") == "4:52"
+
+    # 2. Consensus voting (filters single-frame glitches)
+    samples = [
+        (1, 0, (4, 52, False)),
+        (2, 0, (4, 52, False)),  # glitch on blue
+        (1, 0, (4, 52, False)),
+    ]
+    voted = ocr.consensus_voting(samples)
+    assert voted == (1, 0, (4, 52, False)), f"Voted was {voted}"
+
+    # 3. Template matching verification
+    matched_0 = ocr.template_matcher.match(cv2.imread("templates/0.png", cv2.IMREAD_GRAYSCALE))
+    matched_1 = ocr.template_matcher.match(cv2.imread("templates/1.png", cv2.IMREAD_GRAYSCALE))
+    assert matched_0 is not None and matched_0[0] == "0"
+    assert matched_1 is not None and matched_1[0] == "1"
+
+    print("OCR accuracy and template matching tests passed!")
+
+
 if __name__ == "__main__":
     asyncio.run(run_auth_tests())
     test_overtime_reducer()
+    test_ocr_accuracy()
