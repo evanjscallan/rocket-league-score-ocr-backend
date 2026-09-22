@@ -43,3 +43,6 @@ active_stream_url: str | None = None
 
 video_state = VideoState()
 active_live_capture: Any = None
+
+# Public viewer controls lock
+controls_locked: bool = False

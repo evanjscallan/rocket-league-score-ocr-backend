@@ -170,7 +170,29 @@ def test_ocr_accuracy():
     print("OCR accuracy and template matching tests passed!")
 
 
+def test_controls_lock():
+    from fastapi.testclient import TestClient
+    from endpoints import app
+
+    client = TestClient(app)
+    res = client.get('/controls-lock')
+    assert res.status_code == 200
+    assert 'locked' in res.json()
+
+    res2 = client.put('/controls-lock', json={'locked': True})
+    assert res2.status_code == 200
+    assert res2.json()['locked'] is True
+
+    res3 = client.get('/controls-lock')
+    assert res3.json()['locked'] is True
+
+    res4 = client.put('/controls-lock', json={'locked': False})
+    assert res4.json()['locked'] is False
+    print('Controls lock API tests passed!')
+
+
 if __name__ == "__main__":
     asyncio.run(run_auth_tests())
     test_overtime_reducer()
     test_ocr_accuracy()
+    test_controls_lock()

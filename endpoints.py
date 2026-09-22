@@ -115,6 +115,19 @@ def get_video_state() -> VideoState:
     return constants.video_state
 
 
+@app.get("/controls-lock")
+def get_controls_lock() -> dict[str, bool]:
+    """Return whether viewer controls are locked by an administrator."""
+    return {"locked": bool(getattr(constants, "controls_locked", False))}
+
+
+@app.put("/controls-lock")
+def update_controls_lock(payload: dict[str, bool]) -> dict[str, bool]:
+    """Update viewer controls lock state."""
+    constants.controls_locked = bool(payload.get("locked", False))
+    return {"locked": constants.controls_locked}
+
+
 @app.get("/ocr-calibration")
 def get_ocr_calibration(_: None = Depends(require_admin_session)) -> OCRCalibration:
     """Return the authenticated editor's current OCR calibration."""
