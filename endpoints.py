@@ -33,6 +33,7 @@ from models import (
     GameTimeState,
     NormalizedRectangle,
     OCRCalibration,
+    OCRRegions,
     PreviewFrameMetadata,
     ScoreState,
     StreamStartRequest,
@@ -114,6 +115,39 @@ def get_video_state() -> VideoState:
 def get_ocr_calibration(_: None = Depends(require_admin_session)) -> OCRCalibration:
     """Return the authenticated editor's current OCR calibration."""
     return ocr.current_calibration()
+
+
+@app.get("/ocr-regions")
+def get_ocr_regions() -> OCRRegions:
+    """Return current normalized OCR bounding box regions formatted with timer key."""
+    cal = ocr.current_calibration()
+    return OCRRegions(
+        blue_score=cal.blue_score,
+        timer=cal.time,
+        orange_score=cal.orange_score,
+    )
+
+
+@app.put("/ocr-regions")
+def update_ocr_regions(regions: OCRRegions, _: None = Depends(require_admin_session)) -> OCRRegions:
+    """Save calibration regions atomically and restart state bootstrap when active."""
+    with constants.calibration_lock:
+        constants.active_calibration = OCRCalibration(
+            blue_score=regions.blue_score,
+            time=regions.timer,
+            orange_score=regions.orange_score,
+        )
+        constants.reducer_reset_requested.set()
+        if constants.video_state.status == "running":
+            with constants.event_lock:
+                game_state = constants.latest_event.game_state if constants.latest_event else None
+            publish_game_state_event("running", "OCR calibration updated; state bootstrap restarted", game_state)
+    cal = ocr.current_calibration()
+    return OCRRegions(
+        blue_score=cal.blue_score,
+        timer=cal.time,
+        orange_score=cal.orange_score,
+    )
 
 
 @app.put("/ocr-calibration")

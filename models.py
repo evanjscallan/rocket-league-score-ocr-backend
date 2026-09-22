@@ -83,6 +83,16 @@ class OCRCalibration(BaseModel):
     orange_score: NormalizedRectangle
 
 
+class OCRRegions(BaseModel):
+    """Group the three normalized regions required for score and timer OCR formatted with timer key."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    blue_score: NormalizedRectangle
+    timer: NormalizedRectangle
+    orange_score: NormalizedRectangle
+
+
 class PreviewFrameMetadata(BaseModel):
     """Identify a cached preview and its original frame dimensions."""
 

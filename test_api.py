@@ -66,12 +66,39 @@ async def run_auth_tests():
 
         # 9. PUT endpoint with credentials in JSON body
         cal_body = dict(cal_payload)
+        # pyrefly: ignore [unsupported-operation]
         cal_body["username"] = "admin"
+        # pyrefly: ignore [unsupported-operation]
         cal_body["password"] = "admin"
         res = await client.put("/ocr-calibration", json=cal_body)
+        # 10. GET /ocr-regions returns regions in the expected format
+        res = await client.get("/ocr-regions")
         assert res.status_code == 200
+        regions = res.json()
+        assert "blue_score" in regions
+        assert "timer" in regions
+        assert "orange_score" in regions
+        for key in ["blue_score", "timer", "orange_score"]:
+            assert all(k in regions[key] for k in ["x", "y", "width", "height"])
 
-    print("All auth tests passed!")
+        # 11. PUT /ocr-regions with header authentication updates calibration
+        updated_regions = {
+            "blue_score": {"x": 0.20, "y": 0.15, "width": 0.18, "height": 0.14},
+            "timer": {"x": 0.42, "y": 0.15, "width": 0.16, "height": 0.14},
+            "orange_score": {"x": 0.62, "y": 0.15, "width": 0.18, "height": 0.14},
+        }
+        res = await client.put(
+            "/ocr-regions",
+            headers={"X-Admin-Username": "admin", "X-Admin-Password": "admin"},
+            json=updated_regions,
+        )
+        assert res.status_code == 200
+        saved = res.json()
+        assert saved["blue_score"]["x"] == 0.20
+        assert saved["timer"]["x"] == 0.42
+        assert saved["orange_score"]["x"] == 0.62
+
+    print("All auth and API tests passed!")
 
 
 if __name__ == "__main__":
