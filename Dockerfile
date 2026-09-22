@@ -17,8 +17,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy backend application code and traineddata
 COPY . .
 
-# Ensure image directories exist
-RUN mkdir -p images test-assets
+# Ensure image and template directories exist
+RUN mkdir -p images test-assets templates
 
 # Render automatically binds to $PORT (typically 10000)
 ENV PORT=10000

@@ -286,16 +286,32 @@ class TemplateMatcher:
                 best_digit = digit
 
         if best_digit is not None and best_score >= min_score:
+            # 3 vs 8 topological disambiguation: 8 must have 2 closed holes; 3 has 0 holes
+            if best_digit in ("3", "8"):
+                contours, hier = cv2.findContours(norm_bin, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+                holes = sum(1 for i in range(len(contours)) if hier is not None and hier[0][i][3] >= 0 and cv2.contourArea(contours[i]) > 15)
+                if holes >= 2:
+                    best_digit = "8"
+                elif holes == 0:
+                    best_digit = "3"
             return best_digit, best_score
         return None
 
     def auto_save_template(self, digit: str, crop_bin: np.ndarray) -> None:
-        """Cache a verified high-confidence detection as a template."""
+        """Cache a verified high-confidence detection as a template with geometric validation."""
         if digit in self.templates or not digit.isdigit():
             return
         h, w = crop_bin.shape[:2]
         if h < 10 or w < 4:
             return
+        aspect = w / float(max(1, h))
+
+        # Geometric guardrails: reject misclassified digits from contaminating templates
+        if digit == "1" and aspect > 0.50:
+            return
+        if digit in ("0", "2", "3", "4", "5", "6", "7", "8", "9") and aspect < 0.52:
+            return
+
         try:
             scale = 60.0 / h
             target_w = max(4, int(w * scale))
